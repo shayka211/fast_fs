@@ -8,6 +8,9 @@ publish.workspace = true
 
 [dependencies]
 ucx.workspace = true
+transport.workspace = true
+types.workspace = true
+tokio.workspace = true
 logging.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

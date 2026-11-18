@@ -39,6 +39,13 @@ pub enum Service {
 
 impl Service {
     pub const ALL: [Self; 4] = [Self::Node, Self::Raft, Self::Meta, Self::Data];
+    /// Number of services, for per-service tables (`[T; Service::COUNT]`).
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Dense index `0..COUNT`, for per-service tables.
+    pub const fn index(self) -> usize {
+        self as usize - 1
+    }
 
     fn from_u16(raw: u16) -> Option<Self> {
         Self::ALL.into_iter().find(|s| *s as u16 == raw)
@@ -173,6 +180,13 @@ mod tests {
                 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, // request_id
             ]
         );
+    }
+
+    #[test]
+    fn service_index_is_dense() {
+        for (i, s) in Service::ALL.into_iter().enumerate() {
+            assert_eq!(s.index(), i);
+        }
     }
 
     #[test]

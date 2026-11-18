@@ -230,15 +230,19 @@ The same Raft code runs the control plane and every metadata shard. A node hosts
   public API is cloneable `Handle`s with plain `async fn` methods. The Observer pattern uses
   `watch` (latest value: cluster map, leader) and `broadcast` (events).
 - Native `async fn` in traits; `-> impl Future + Send` where spawned; `dyn` only when needed.
-- **`TransportActor`:** a dedicated thread owns the UCX worker (`!Send`) and receives via
-  `progress_with` (zero-copy). Two modes: busy-poll (lowest latency) or event (sleep on
-  `ucp_worker_get_efd`).
+- **Thread-per-core** (measured in M3b.2): each core thread runs a tokio current-thread
+  runtime with its own `Transport` (UCX worker, `!Send`), its progress driver, and the
+  services it owns. Handlers run synchronously inside the poll, with zero copy. On-core
+  `request().await` costs 0.20 µs one-way vs 1.6 µs from another thread via `RemoteHandle`,
+  so hot callers stay on the owning core and only cold ones (FUSE, CLI) cross threads.
+  Driver modes: busy-poll (now) and event (sleep on `ucp_worker_get_efd`, M3b.3).
+- **Requests always have deadlines** (`tokio::time::timeout`); messages can be lost.
 - **Messages are addressed by `NodeId`**, never by endpoint. A wire header on every message
   carries `{protocol version, source NodeId, service, kind}`.
 - **Connections are lazy:** opened on first use and capped with an LRU (no full mesh at 10k).
   UCX's DC transport helps on Mellanox. Worker addresses come from the cluster map. With
   thread-per-core, a node publishes one address per worker.
-- `Transport` trait: `UcxTransport` and `SimTransport`.
+- `Transport` trait, extracted in M4.1 when `SimTransport` becomes its second implementation.
 - Serialization: `bincode`/`postcard` for control messages; raw bytes for chunk payloads.
 
 ## Connections (decided in M2, measured)
@@ -305,9 +309,9 @@ Test layers:
 | M3a ✅ | `ucx`: non-blocking send, background close, zero-copy `progress_with`, recoverable errors | 0.075 µs vs C 0.065 µs |
 | **Transport** | | |
 | M3b.1 ✅ | `types` crate: ID newtypes + versioned wire header (encode/decode) | round-trip + rejects bad versions (proptest) |
-| M3b.2 | `transport` crate: `TransportActor` thread (busy-poll) + `TransportHandle` (tokio), messages by `NodeId` | async pingpong works; latency recorded |
+| M3b.2 ✅ | `transport` crate: per-core `Transport` (busy-poll driver), routes by `Service`, request/response by `NodeId`, `RemoteHandle` for other threads | on-core 0.20 µs, cross-thread 1.6 µs one-way (raw 0.10) |
 | M3b.3 | event mode (`efd`/`arm`) | both modes benchmarked, CPU use compared |
-| M3c.1 | `node` binary + config (`node_id`, seeds, drives, failure domain) + join via seeds, lazy connections | 3 local nodes exchange messages |
+| M3c.1 | `node` binary + config (`node_id`, seeds, drives, failure domain) + **in-band join** (a node announces itself in its first message, so no request comes from an unknown peer) via seeds, lazy connections | 3 local nodes exchange messages |
 | M3c.2 | `launcher` (spawn N nodes, kill/restart) + heartbeat liveness via `watch` | kill -9 a node → others report it down |
 | **Consensus** | | |
 | M4.1 | sans-IO Raft: election + pre-vote; simulator skeleton | one leader per term over many seeds |

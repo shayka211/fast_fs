@@ -13,6 +13,7 @@ ucx-sys = { path = "crates/ucx-sys" }
 ucx = { path = "crates/ucx" }
 logging = { path = "crates/logging" }
 types = { path = "crates/types" }
+transport = { path = "crates/transport" }
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -22,6 +23,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hdrhistogram = { version = "7", default-features = false }
 proptest = "1"
+rustc-hash = "2"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
 # build-time
 bindgen = "0.73"

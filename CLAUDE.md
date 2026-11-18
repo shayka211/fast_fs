@@ -45,6 +45,9 @@ Only create a crate when a milestone needs it.
   its rustdoc via `#![doc = include_str!("../README.md")]`, so there's one source and its examples are
   compile-checked. Update it with the code. `cargo doc` must pass with `-D warnings`.
 - Async traits: native `async fn`; `-> impl Future<Output = _> + Send` when spawned.
+- **Every request has a deadline** (`tokio::time::timeout`); messages between nodes can be
+  lost. Per-core state is `!Send` and lives on its core (thread-per-core); other threads go
+  through `Send` handles.
 
 ## Logging / debugging
 

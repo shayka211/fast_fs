@@ -1,0 +1,18 @@
+[package]
+name = "transport"
+description = "Node-to-node messaging over UCX: routing by NodeId/Service, async request/response"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ucx.workspace = true
+types.workspace = true
+tokio.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

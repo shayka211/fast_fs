@@ -198,6 +198,47 @@ Pitfalls we hit while measuring:
 Remaining ~10 ns: the client's `send_blocking` plus the per-call sink setup and re-entrancy
 guard in `progress_with`. It's left for now; M3b's actor thread adds far more than this.
 
+## Case study 3: the async transport (M3b.2)
+
+The question: how much does going through the `transport` crate cost (async
+`request().await` by `NodeId`) compared with raw `ucx`, and what does calling it from
+another thread add? All three measured on the same pinned cores:
+
+| Path | First version | After fixes |
+|---|---|---|
+| raw `ucx` (sync loop) | 0.10 µs | 0.10 µs |
+| transport, on-core | 0.29 µs | **0.20 µs** |
+| transport, cross-thread (`RemoteHandle`) | 1.63 µs | 1.6 µs |
+
+What the on-core profile (`perf record -e cpu-clock:u`) showed:
+- **22% in `__vdso_clock_gettime`, though the benchmark read no clocks** (`--overall-only`).
+  The reads came from tokio. The driver called `yield_now()` after every UCX poll, and each
+  yield is a scheduler tick where tokio's time driver reads the clock to fire timers. Fix:
+  yield immediately only when a poll delivered something (woken tasks must run), and
+  otherwise spin and yield every 64 empty polls.
+- **About 4% in SipHash** (`RandomState::hash_one`), from the std `HashMap` keyed by `NodeId`
+  and `request_id`. Fix: `FxHashMap`. Keys come from our own nodes, so DoS-resistant
+  hashing isn't needed.
+- The yield fix first made cross-thread *worse* (1.63 → 2.0 µs): remote commands become
+  spawned tasks, which now waited up to 64 polls. Fix: also yield immediately when
+  commands ran. **Re-measure every path after every change.**
+
+What the numbers say:
+- **The cross-thread hop costs ~8x the on-core path:** two channel hops plus waking a
+  sleeping thread. That's the data behind thread-per-core: hot callers (Raft,
+  metadata, placement groups) run on the core that owns the transport, and only cold callers
+  (FUSE threads, the CLI) pay the hop.
+- The remaining ~0.1 µs on-core overhead is per-request bookkeeping: a `oneshot`
+  allocation, a task wakeup through the scheduler, and header encode/decode. Possible later
+  work: a slab of reusable reply slots instead of `oneshot`, and fewer time-driver
+  interactions.
+
+A bug the benchmark exposed: **a request without a deadline can wait forever.** The server
+registered a new client a moment *after* the client's first request arrived, so the reply
+had nowhere to go, and the client hung. Requests now always run under a deadline in our
+code. The proper fix, in-band joining (a node announces itself in its first message), is
+planned for M3c.
+
 ## Rules of thumb we learned
 
 1. Pin both sides before measuring anything.
@@ -210,3 +251,5 @@ guard in `progress_with`. It's left for now; M3b's actor thread adds far more th
 7. "Zero-copy" is a hypothesis, not a fact: measure it. Fewer copies can still mean more work.
 8. A/B against the previous commit in a separate worktree, alternating runs, same cores.
 9. Before benchmarking, check nothing else is spinning on your cores.
+10. In an async runtime, yielding isn't free: every scheduler tick may read the clock.
+11. Std `HashMap` hashing (SipHash) is slow for integer keys from trusted sources; use Fx.

@@ -13,6 +13,18 @@ and the other (the **client**) measures how long each round trip takes.
   UCX worker addresses once over plain TCP, then talk only over the fast transport.
 - **It catches performance regressions** in the transport layer as the code grows.
 
+## Modes
+
+| Subcommands | Path measured |
+|---|---|
+| `server` / `client` | **raw `ucx`**: one worker, synchronous loop, zero-copy receive. The baseline. |
+| `transport-server` / `transport-client` | **through the `transport` crate**: async `request().await` addressed by `NodeId`, on the transport's own thread (on-core) |
+| `transport-server` / `transport-client --cross-thread` | the same, but called from **another thread** via `RemoteHandle`: what FUSE threads would pay |
+
+The rest of this section describes the raw mode. The transport modes use the same TCP
+bootstrap, except the client announces its own `NodeId` in the hello
+(`[node id u32][worker address]`), and requests and replies go through `Transport`.
+
 ## How it works
 
 ```
@@ -85,6 +97,10 @@ taskset -c 4 ./target/release/pingpong client
 | `--warmup N` | client | `10000` | Unmeasured round trips first (finishes connection setup, warms caches) |
 | `--size BYTES` | client | `8` | Payload size. Above a few KB UCX switches protocols (copy-in, then rendezvous/zero-copy), so latency jumps. |
 | `--overall-only` | client | off | Skip the per-iteration clock reads. Gives only the `overall` number, the cleanest comparison with C (see below). |
+| `--cross-thread` | `transport-client` | off | Run the benchmark on a different thread than the transport (through `RemoteHandle`). Pin to two cores, e.g. `taskset -c 4,5`. |
+
+The transport modes always use `--err-mode none`. The client options (`--iters`,
+`--warmup`, `--size`, `--overall-only`) work the same for `client` and `transport-client`.
 
 Both sides must use the same `--err-mode`.
 
@@ -138,6 +154,15 @@ Typical numbers on the dev box (Ryzen 5600X, pinned to cores 2 and 4, 8 B, fresh
 | `pingpong client --overall-only` | 0.075 µs |
 | `pingpong client` (with percentiles) | 0.090 µs (p50 0.090 µs) |
 | `--err-mode peer` (TCP) | ~4.5 µs |
+
+Transport modes, measured on cores 3 and 4 (cross-thread client on 4 and 5). The raw row is
+repeated as a same-core reference:
+
+| Setup | p50 | overall |
+|---|---|---|
+| `client` (raw) | 0.095 µs | 0.10 µs |
+| `transport-client` (on-core) | 0.185 µs | 0.20 µs |
+| `transport-client --cross-thread` | 1.44 µs | 1.6 µs |
 
 Both sides receive with `Worker::progress_with`, a closure that sees each message's bytes
 *borrowed* from UCX during progress (no copy, no allocation). The server copies pings into a
