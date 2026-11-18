@@ -1,8 +1,15 @@
-//! UCP worker: the progress engine, plus Active Message receive.
+//! UCP worker: the progress engine, Active Message receive, and background requests.
+//!
+//! Two ways to receive, one code path:
+//! - [`Worker::progress_with`]: a closure sees each message *during* progress, borrowing
+//!   UCX's buffers (no copy, no allocation). The fast path.
+//! - [`Worker::progress`] + [`Worker::try_recv`]: messages are copied into a queue.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 use std::rc::Rc;
 use std::slice;
@@ -13,18 +20,18 @@ use tracing::{debug, error, trace, warn};
 use ucx_sys as sys;
 
 use crate::context::Context;
+use crate::message::{AmMessage, AmView, Header};
+use crate::request::{Orphan, reap};
 use crate::status::{Error, Result, Status, StatusPtr, check};
 
 /// Active Message handler id. Each service registers its own id.
 pub type AmId = u16;
 
-/// A fully received Active Message (eager and rendezvous are both delivered whole).
-#[derive(Debug)]
-pub struct AmMessage {
-    pub id: AmId,
-    pub header: Vec<u8>,
-    pub data: Vec<u8>,
-}
+/// How long dropping a [`Worker`] waits for background requests (closes, sends).
+const DROP_DRAIN: Duration = Duration::from_millis(100);
+
+/// The closure installed by `progress_with`, lifetime-erased (see `progress_with`).
+type Sink = *mut (dyn for<'v> FnMut(AmView<'v>) + 'static);
 
 /// Single-threaded UCP worker. `!Send` by construction: a worker (and everything
 /// created from it) must stay on the thread that created it.
@@ -33,17 +40,34 @@ pub struct Worker {
     pub(crate) inner: Rc<WorkerInner>,
 }
 
-#[derive(Debug)]
 pub(crate) struct WorkerInner {
     pub(crate) raw: sys::ucp_worker_h,
     inbox: RefCell<VecDeque<AmMessage>>,
+    /// Set only while `progress_with` runs.
+    sink: Cell<Option<Sink>>,
+    /// Guards against re-entering UCX progress from a receive callback (forbidden by UCX).
+    in_progress: Cell<bool>,
+    /// A panic caught inside a C callback, re-raised once `progress` is back in Rust.
+    panic: RefCell<Option<Box<dyn Any + Send>>>,
     /// Per-id callback args. Boxed so their addresses stay stable when the Vec grows:
     /// UCX holds raw pointers to them.
     #[allow(clippy::vec_box, reason = "UCX stores pointers to the elements")]
     handlers: RefCell<Vec<Box<AmHandlerArg>>>,
+    /// Requests nobody waits on (dropped sends, endpoint closes); reaped in `progress`.
+    orphans: RefCell<Vec<Orphan>>,
     pending_rndv: Cell<usize>,
     // Dropped after `raw` is destroyed (field order + explicit Drop).
     _ctx: Arc<Context>,
+}
+
+impl std::fmt::Debug for WorkerInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerInner")
+            .field("raw", &self.raw)
+            .field("inbox", &self.inbox.borrow().len())
+            .field("orphans", &self.orphans.borrow().len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -56,7 +80,7 @@ struct AmHandlerArg {
 struct PendingRndv {
     worker: *const WorkerInner,
     id: AmId,
-    header: Vec<u8>,
+    header: Header,
     data: Vec<u8>,
 }
 
@@ -77,22 +101,74 @@ impl Worker {
             inner: Rc::new(WorkerInner {
                 raw,
                 inbox: RefCell::default(),
+                sink: Cell::new(None),
+                in_progress: Cell::new(false),
+                panic: RefCell::new(None),
                 handlers: RefCell::default(),
+                orphans: RefCell::default(),
                 pending_rndv: Cell::new(0),
                 _ctx: Arc::clone(ctx),
             }),
         })
     }
 
-    /// Drives communication; callbacks (AM receive, errors, completions) run in here.
-    /// Returns the number of events processed.
+    /// Drives communication; received messages are queued for [`Self::try_recv`].
+    /// Returns the number of UCX events processed.
+    ///
+    /// # Errors
+    /// [`Error::Reentrant`] if called from inside a `progress_with` closure.
     #[inline]
-    pub fn progress(&self) -> u32 {
-        // SAFETY: the worker is valid and only used from this thread (`!Send`).
-        unsafe { sys::ucp_worker_progress(self.inner.raw) }
+    pub fn progress(&self) -> Result<u32> {
+        self.inner.progress(None, "Worker::progress")
     }
 
-    /// Starts delivering Active Messages with this id into the inbox ([`Self::try_recv`]).
+    /// Drives communication, handing each received message to `on_message` while UCX's
+    /// buffers are still valid: no copy, no allocation. Copy out what must outlive the
+    /// call (`AmView::to_message`).
+    ///
+    /// Inside `on_message`, non-blocking [`crate::Endpoint::send`] is allowed; anything
+    /// that progresses this worker (`progress*`, `send_blocking`, `drain`) returns
+    /// [`Error::Reentrant`] — UCX forbids re-entering progress from a callback.
+    ///
+    /// If `on_message` panics, the panic is caught before it reaches UCX's C code and
+    /// re-raised from this call once progress has finished, as an ordinary Rust panic:
+    /// it can be caught with `catch_unwind` and the worker remains usable. Messages that
+    /// arrive after the panic in the same call are queued for [`Self::try_recv`].
+    ///
+    /// # Errors
+    /// [`Error::Reentrant`] if called from inside another `progress_with` closure.
+    #[inline]
+    pub fn progress_with(&self, mut on_message: impl FnMut(AmView<'_>)) -> Result<u32> {
+        let sink: &mut (dyn for<'v> FnMut(AmView<'v>) + '_) = &mut on_message;
+        // SAFETY: only the trait object's lifetime bound is erased. The pointer is
+        // installed for the duration of `progress` below and cleared before we return,
+        // so it is never used after `on_message` goes out of scope.
+        let sink: Sink = unsafe { std::mem::transmute(ptr::from_mut(sink)) };
+        self.inner.progress(Some(sink), "Worker::progress_with")
+    }
+
+    /// Progresses until all background requests (dropped sends, endpoint closes) finish
+    /// or `timeout` passes. Returns `true` if everything completed. Call before shutdown
+    /// to make sure fire-and-forget sends were actually delivered.
+    ///
+    /// # Errors
+    /// [`Error::Reentrant`] if called from inside a `progress_with` closure.
+    pub fn drain(&self, timeout: Duration) -> Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.inner.progress(None, "Worker::drain")?;
+            let left = self.inner.orphans.borrow().len();
+            if left == 0 {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                debug!(left, "drain timed out");
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Starts delivering Active Messages with this id.
     pub fn register_am(&self, id: AmId) -> Result<()> {
         let arg = Box::new(AmHandlerArg {
             worker: Rc::as_ptr(&self.inner),
@@ -105,6 +181,7 @@ impl Worker {
                 | sys::UCP_AM_HANDLER_PARAM_FIELD_FLAGS)
                 .into(),
             id: id.into(),
+            // No PERSISTENT_DATA: measured slower on shm (see message.rs).
             flags: sys::UCP_AM_FLAG_WHOLE_MSG,
             cb: Some(am_recv_cb),
             arg: ptr::from_ref(&*arg).cast_mut().cast(),
@@ -127,9 +204,9 @@ impl Worker {
         check("ucp_worker_get_address", unsafe {
             sys::ucp_worker_get_address(self.inner.raw, &mut addr, &mut len)
         })?;
-        // SAFETY: UCX returned a buffer of `len` bytes, copied then released exactly once.
+        // SAFETY: UCX returned `len` readable bytes; copied, then released exactly once.
         let bytes = unsafe {
-            let bytes = copy_bytes(addr.cast(), len);
+            let bytes = slice::from_raw_parts(addr.cast::<u8>(), len).to_vec();
             sys::ucp_worker_release_address(self.inner.raw, addr);
             bytes
         };
@@ -137,60 +214,129 @@ impl Worker {
         Ok(bytes)
     }
 
-    /// Pops the next received Active Message, if any. Call [`Self::progress`] first.
+    /// Pops the next queued message, if any (queued by [`Self::progress`]).
     #[inline]
     pub fn try_recv(&self) -> Option<AmMessage> {
         self.inner.inbox.borrow_mut().pop_front()
     }
 }
 
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // Give background closes/sends a moment to finish — unless we're unwinding from a
+        // panic: progressing then could panic again (double panic = abort).
+        if std::thread::panicking() {
+            return;
+        }
+        match self.drain(DROP_DRAIN) {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                left = self.inner.orphans.borrow().len(),
+                "worker dropped with requests still in flight"
+            ),
+            Err(e) => warn!(error = %e, "worker dropped inside its own receive callback"),
+        }
+    }
+}
+
 impl WorkerInner {
-    /// Completes a non-blocking operation by progressing until it finishes.
-    pub(crate) fn wait(&self, op: &'static str, ptr: sys::ucs_status_ptr_t) -> Result<()> {
-        self.wait_until(op, ptr, None)
+    /// Fails with [`Error::Reentrant`] when called from inside a receive callback.
+    /// Operations that lend borrowed memory to UCX must check this *before* starting.
+    #[inline]
+    pub(crate) fn ensure_not_in_callback(&self, op: &'static str) -> Result<()> {
+        if self.in_progress.get() {
+            Err(Error::Reentrant { op })
+        } else {
+            Ok(())
+        }
     }
 
-    /// Like [`Self::wait`] but gives up (freeing the request, which UCX then releases on
-    /// completion) after `timeout`.
-    pub(crate) fn wait_until(
-        &self,
-        op: &'static str,
-        ptr: sys::ucs_status_ptr_t,
-        timeout: Option<Duration>,
-    ) -> Result<()> {
+    #[inline]
+    pub(crate) fn progress(&self, sink: Option<Sink>, op: &'static str) -> Result<u32> {
+        self.ensure_not_in_callback(op)?;
+        Ok(self.progress_checked(sink))
+    }
+
+    /// The one place UCX progress happens: sink install, background request reaping, and
+    /// re-raising panics caught in callbacks. Caller guarantees we're not in a callback.
+    #[inline]
+    fn progress_checked(&self, sink: Option<Sink>) -> u32 {
+        self.in_progress.set(true);
+        self.sink.set(sink);
+        // SAFETY: the worker is valid, used only from this thread (`!Send`), and not
+        // re-entered (checked by the caller).
+        let events = unsafe { sys::ucp_worker_progress(self.raw) };
+        self.sink.set(None);
+        self.in_progress.set(false);
+        if !self.orphans.borrow().is_empty() {
+            reap(&mut self.orphans.borrow_mut());
+        }
+        let caught = self.panic.borrow_mut().take();
+        if let Some(payload) = caught {
+            // Back in Rust frames: safe to unwind now, and the worker state is consistent.
+            panic::resume_unwind(payload);
+        }
+        events
+    }
+
+    /// Completes a non-blocking operation by progressing until it finishes.
+    ///
+    /// Precondition: the caller ran [`Self::ensure_not_in_callback`] before starting the
+    /// operation, so progressing here is always allowed (no error path that could return
+    /// while UCX still reads borrowed memory).
+    pub(crate) fn wait(&self, op: &'static str, ptr: sys::ucs_status_ptr_t) -> Result<()> {
         let req = match StatusPtr::decode(ptr) {
             StatusPtr::Done => return Ok(()),
-            StatusPtr::Failed(status) => return Err(Error { op, status }),
+            StatusPtr::Failed(status) => return Err(Error::Ucx { op, status }),
             StatusPtr::Pending(req) => req,
         };
-        let deadline = timeout.map(|t| Instant::now() + t);
         let status = loop {
-            // SAFETY: valid worker on its owning thread; `req` is a live request.
-            let status = unsafe {
-                sys::ucp_worker_progress(self.raw);
-                sys::ucp_request_check_status(req)
-            };
+            self.progress_checked(None);
+            // SAFETY: `req` is a live request.
+            let status = unsafe { sys::ucp_request_check_status(req) };
             if status != sys::UCS_INPROGRESS {
                 break status;
             }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                warn!(op, "operation timed out; abandoning request");
-                break sys::UCS_ERR_TIMED_OUT;
-            }
         };
-        // SAFETY: `req` is freed exactly once; UCX defers release if still in flight.
+        // SAFETY: `req` is completed and freed exactly once.
         unsafe { sys::ucp_request_free(req) };
         check(op, status)
     }
 
-    fn deliver(&self, msg: AmMessage) {
+    /// Hands an in-flight request to the worker to finish in the background.
+    pub(crate) fn adopt(&self, orphan: Orphan) {
+        trace!(op = orphan.op, "request continues in background");
+        self.orphans.borrow_mut().push(orphan);
+    }
+
+    /// The single delivery point: to the `progress_with` closure if one is running (and
+    /// hasn't panicked during this call), otherwise into the queue. Never unwinds: it is
+    /// called from C callbacks, so panics are caught and stored for `progress` to re-raise.
+    fn dispatch(&self, msg: AmView<'_>) {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| self.deliver(msg)));
+        if let Err(payload) = result {
+            error!(
+                am_id = msg.id,
+                "panic in receive handler; re-raising after progress"
+            );
+            *self.panic.borrow_mut() = Some(payload);
+        }
+    }
+
+    fn deliver(&self, msg: AmView<'_>) {
         trace!(
             am_id = msg.id,
             header_len = msg.header.len(),
             data_len = msg.data.len(),
             "am recv"
         );
-        self.inbox.borrow_mut().push_back(msg);
+        let panicked = self.panic.borrow().is_some();
+        match self.sink.get() {
+            // SAFETY: a sink is only installed while its closure is alive and borrowed
+            // mutably by `progress_with`; callbacks run on this thread inside that call.
+            Some(sink) if !panicked => unsafe { (*sink)(msg) },
+            _ => self.inbox.borrow_mut().push_back(msg.to_message()),
+        }
     }
 }
 
@@ -203,22 +349,27 @@ impl Drop for WorkerInner {
                 "destroying worker with rendezvous receives in flight (leaked)"
             );
         }
-        // SAFETY: endpoints/listeners hold an `Rc<WorkerInner>`, so all are gone by now.
+        // Requests adopted after `Worker::drop` (e.g. endpoints closed later). Free the
+        // handles but leak what they protect: UCX may still touch it until destroy.
+        for o in self.orphans.get_mut().drain(..) {
+            // SAFETY: live request, freed exactly once; UCX defers release if in flight.
+            unsafe { sys::ucp_request_free(o.req) };
+            std::mem::forget(o.keep);
+        }
+        // SAFETY: endpoints hold an `Rc<WorkerInner>`, so all are gone by now.
         unsafe { sys::ucp_worker_destroy(self.raw) };
         debug!("ucp worker destroyed");
     }
 }
 
-/// Copies `len` bytes from a possibly-NULL C pointer.
-///
 /// # Safety
-/// If `len > 0`, `ptr` must be valid for reads of `len` bytes.
-unsafe fn copy_bytes(ptr: *const c_void, len: usize) -> Vec<u8> {
+/// If `len > 0`, `ptr` must be valid for reads of `len` bytes for `'a`.
+unsafe fn bytes<'a>(ptr: *const c_void, len: usize) -> &'a [u8] {
     if len == 0 {
-        Vec::new()
+        &[]
     } else {
         // SAFETY: guaranteed by the caller.
-        unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) }.to_vec()
+        unsafe { slice::from_raw_parts(ptr.cast::<u8>(), len) }
     }
 }
 
@@ -232,29 +383,31 @@ unsafe extern "C" fn am_recv_cb(
 ) -> sys::ucs_status_t {
     // SAFETY: `arg` is the boxed AmHandlerArg registered in `register_am`; it and its
     // worker outlive every callback (callbacks only run inside progress on a live worker).
-    let (worker, id) = unsafe {
+    let (worker_ptr, id) = unsafe {
         let arg = &*arg.cast::<AmHandlerArg>();
-        (&*arg.worker, arg.id)
+        (arg.worker, arg.id)
     };
+    // SAFETY: see above.
+    let worker = unsafe { &*worker_ptr };
     // SAFETY: UCX passes a valid param struct for the duration of the callback.
-    let param = unsafe { &*param };
-    // SAFETY: UCX guarantees `header` is valid for `header_length` bytes here.
-    let header = unsafe { copy_bytes(header, header_length) };
+    let recv_attr = unsafe { (*param).recv_attr };
+    // SAFETY: UCX guarantees `header` is valid for `header_length` bytes in the callback.
+    let header = unsafe { bytes(header, header_length) };
 
-    if param.recv_attr & u64::from(sys::UCP_AM_RECV_ATTR_FLAG_RNDV) == 0 {
-        // Eager: data is valid only during this callback, so copy it out.
+    if recv_attr & u64::from(sys::UCP_AM_RECV_ATTR_FLAG_RNDV) == 0 {
+        // Eager: `data` is valid for the duration of this callback.
         // SAFETY: valid for `length` bytes during the callback.
-        let data = unsafe { copy_bytes(data, length) };
-        worker.deliver(AmMessage { id, header, data });
+        let data = unsafe { bytes(data, length) };
+        worker.dispatch(AmView { id, header, data });
         return sys::UCS_OK;
     }
 
     // Rendezvous: `data` is a descriptor; fetch the payload into our own buffer.
     trace!(am_id = id, length, "am rndv recv started");
     let pending = Box::into_raw(Box::new(PendingRndv {
-        worker,
+        worker: worker_ptr,
         id,
-        header,
+        header: Header::from_slice(header),
         data: vec![0; length],
     }));
     let params = sys::ucp_request_param_t {
@@ -280,7 +433,7 @@ unsafe extern "C" fn am_recv_cb(
         StatusPtr::Done => {
             // SAFETY: completed inline, so the callback will not run; reclaim the box.
             let p = unsafe { Box::from_raw(pending) };
-            worker.deliver(p.into_message());
+            worker.dispatch(p.view());
         }
         StatusPtr::Failed(s) => {
             // SAFETY: failed inline, the callback will not run; reclaim the box.
@@ -293,11 +446,11 @@ unsafe extern "C" fn am_recv_cb(
 }
 
 impl PendingRndv {
-    fn into_message(self) -> AmMessage {
-        AmMessage {
+    fn view(&self) -> AmView<'_> {
+        AmView {
             id: self.id,
-            header: self.header,
-            data: self.data,
+            header: &self.header,
+            data: &self.data,
         }
     }
 }
@@ -315,7 +468,7 @@ unsafe extern "C" fn rndv_done_cb(
     worker.pending_rndv.set(worker.pending_rndv.get() - 1);
     if status == sys::UCS_OK {
         p.data.truncate(length);
-        worker.deliver(p.into_message());
+        worker.dispatch(p.view());
     } else {
         error!(am_id = p.id, status = %Status(status), "am rndv recv failed");
     }

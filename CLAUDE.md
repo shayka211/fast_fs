@@ -18,6 +18,10 @@ Only create a crate when a milestone needs it.
 - Runtime lookup: a RUNPATH (`.cargo/config.toml`) points at `.ucx/release/lib`, so binaries
   run directly from `target/`. `LD_LIBRARY_PATH` overrides it (e.g. `.ucx/debug/lib`).
 - `ucx-sys` has `doctest = false` (UCX's C doc comments aren't Rust).
+- Hot paths receive with `Worker::progress_with` (borrowed `AmView`, zero-copy); only
+  non-blocking `Endpoint::send` inside it. `progress()` + `try_recv()` copies (convenience).
+- Benchmark A/B against the previous commit (separate worktree, same pinned cores,
+  alternating runs) and check no stray process spins on those cores. See `docs/PERF.md`.
 
 ## Conventions
 
@@ -32,7 +36,14 @@ Only create a crate when a milestone needs it.
   can't. No single-impl traits unless they are test seams.
 - **Errors:** `thiserror` per library crate with explicit retry variants
   (`NotLeader { hint }`, `StaleEpoch`, `Timeout`); `anyhow` only in binaries.
+- **No panics as API behavior.** Misuse returns an error (e.g. `ucx::Error::Reentrant`), not a
+  panic. Panics from user code running inside C callbacks are caught at the FFI boundary
+  and re-raised in Rust, so they are catchable and leave the state usable. `Drop` never
+  panics (it checks `std::thread::panicking()` before doing work that could).
 - **unsafe:** confined to `ucx-sys`/`ucx`; every `unsafe` block gets a `// SAFETY:` comment.
+- **Docs:** every crate has a `README.md` (purpose, types, usage, rules, logging), included as
+  its rustdoc via `#![doc = include_str!("../README.md")]`, so there's one source and its examples are
+  compile-checked. Update it with the code. `cargo doc` must pass with `-D warnings`.
 - Async traits: native `async fn`; `-> impl Future<Output = _> + Send` when spawned.
 
 ## Logging / debugging
@@ -49,3 +60,4 @@ Only create a crate when a milestone needs it.
 ## Checks
 
 `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`

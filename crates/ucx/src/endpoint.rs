@@ -5,15 +5,13 @@ use std::ffi::{CStr, CString, c_void};
 use std::fmt;
 use std::ptr;
 use std::rc::Rc;
-use std::time::Duration;
 
 use tracing::{debug, info, trace, warn};
 use ucx_sys as sys;
 
-use crate::status::{Error, Result, Status, check};
+use crate::request::{Orphan, SendBuf, SendRequest};
+use crate::status::{Error, Result, Status, StatusPtr, check};
 use crate::worker::{AmId, Worker, WorkerInner};
-
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A connection to one peer, created from the peer's worker address. Usable immediately:
 /// UCX queues sends until wire-up completes, so no Connecting/Connected typestate is needed.
@@ -23,10 +21,13 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 /// activates its TCP transport and the data path stays on shared memory / RDMA.
 pub struct Endpoint {
     raw: sys::ucp_ep_h,
-    /// Boxed so the error callback's `arg` pointer stays stable.
-    state: Box<EpState>,
+    /// Shared (not just boxed) so a background close can keep it alive: UCX may call the
+    /// error callback, whose `arg` points here, until the close completes.
+    state: Rc<EpState>,
     worker: Rc<WorkerInner>,
 }
+
+const SEND_OP: &str = "ucp_am_send_nbx";
 
 struct EpState {
     peer: String,
@@ -79,7 +80,7 @@ impl Endpoint {
         peer: impl Into<String>,
         mode: ErrorMode,
     ) -> Result<Self> {
-        let state = Box::new(EpState {
+        let state = Rc::new(EpState {
             peer: peer.into(),
             mode,
             failed: Cell::new(None),
@@ -97,7 +98,7 @@ impl Endpoint {
             err_mode: mode.raw(),
             err_handler: sys::ucp_err_handler {
                 cb: Some(ep_error_cb),
-                arg: ptr::from_ref(&*state).cast_mut().cast(),
+                arg: Rc::as_ptr(&state).cast_mut().cast(),
             },
             name: name.as_ptr(),
             ..Default::default()
@@ -105,7 +106,7 @@ impl Endpoint {
 
         let mut raw = ptr::null_mut();
         // SAFETY: params (and the address/name they point to) are valid for the call;
-        // the error-handler arg is boxed and outlives the endpoint.
+        // the error-handler arg is kept alive (Rc) until the endpoint is fully closed.
         check("ucp_ep_create", unsafe {
             sys::ucp_ep_create(worker.inner.raw, &params, &mut raw)
         })?;
@@ -126,21 +127,59 @@ impl Endpoint {
         self.state.failed.get()
     }
 
-    /// Sends an Active Message and waits (progressing the worker) until the buffers can be
-    /// reused. Blocking; M3 replaces this with async. The receiver does not learn which
-    /// endpoint a message came from: protocols carry the sender's identity in `header`.
-    pub fn send_am(&self, id: AmId, header: &[u8], data: &[u8]) -> Result<()> {
+    /// Non-blocking send. Takes ownership of `data` until UCX is done with it; `header` is
+    /// copied by UCX immediately. Small messages usually complete inside this call (no
+    /// request is allocated). Drop the returned request to fire-and-forget.
+    ///
+    /// The receiver does not learn which endpoint a message came from: protocols carry the
+    /// sender's identity in `header`.
+    pub fn send<B: SendBuf>(&self, id: AmId, header: &[u8], data: B) -> Result<SendRequest<B>> {
+        let status = self.start_send(id, header, data.as_bytes())?;
+        Ok(match StatusPtr::decode(status) {
+            StatusPtr::Done => SendRequest::done(&self.worker),
+            StatusPtr::Failed(status) => {
+                return Err(Error::Ucx {
+                    op: SEND_OP,
+                    status,
+                });
+            }
+            StatusPtr::Pending(req) => SendRequest::pending(&self.worker, req, data),
+        })
+    }
+
+    /// Sends borrowed data, progressing this worker until UCX no longer needs it.
+    ///
+    /// Only this worker is progressed: if the peer is driven by the same thread, the first
+    /// send can deadlock waiting for a wire-up the peer never progresses.
+    ///
+    /// # Errors
+    /// A UCX failure, or [`Error::Reentrant`] (nothing is sent) if called from inside a
+    /// `progress_with` closure — use the non-blocking [`Self::send`] there.
+    pub fn send_blocking(&self, id: AmId, header: &[u8], data: &[u8]) -> Result<()> {
+        // Checked before sending: we must never return while UCX still reads `data`.
+        self.worker
+            .ensure_not_in_callback("Endpoint::send_blocking")?;
+        let status = self.start_send(id, header, data)?;
+        self.worker.wait(SEND_OP, status)
+    }
+
+    fn start_send(&self, id: AmId, header: &[u8], data: &[u8]) -> Result<sys::ucs_status_ptr_t> {
         if let Some(status) = self.failed() {
-            return Err(Error {
-                op: "ucp_am_send_nbx",
+            return Err(Error::Ucx {
+                op: SEND_OP,
                 status,
             });
         }
         trace!(peer = %self.state.peer, am_id = id, header_len = header.len(), data_len = data.len(), "am send");
-        let params = sys::ucp_request_param_t::default();
-        // SAFETY: header/data stay borrowed until `wait` returns, i.e. until UCX is done
-        // with them.
-        let status = unsafe {
+        let params = sys::ucp_request_param_t {
+            op_attr_mask: sys::UCP_OP_ATTR_FIELD_FLAGS,
+            flags: sys::UCP_AM_SEND_FLAG_COPY_HEADER,
+            ..Default::default()
+        };
+        // SAFETY: the header is copied by UCX during the call (COPY_HEADER); the caller
+        // keeps `data` alive until the returned request completes (`send` moves it into
+        // the SendRequest, `send_blocking` waits before returning).
+        Ok(unsafe {
             sys::ucp_am_send_nbx(
                 self.raw,
                 id.into(),
@@ -150,8 +189,7 @@ impl Endpoint {
                 data.len(),
                 &params,
             )
-        };
-        self.worker.wait("ucp_am_send_nbx", status)
+        })
     }
 
     /// Transports and devices this endpoint selected (meaningful once wire-up is done).
@@ -203,9 +241,10 @@ impl fmt::Debug for Endpoint {
 }
 
 impl Drop for Endpoint {
+    /// Starts the close and returns immediately; the worker finishes it in the background
+    /// (see [`Worker::drain`]). Graceful close flushes outstanding sends. A failed peer
+    /// can't be flushed, so force-close — which UCX only permits in `ErrorMode::Peer`.
     fn drop(&mut self) {
-        // Graceful close flushes outstanding sends. A failed peer can't be flushed, so
-        // force-close — which UCX only permits in `ErrorMode::Peer`.
         let flags = if self.failed().is_some() && self.state.mode == ErrorMode::Peer {
             sys::UCP_EP_CLOSE_FLAG_FORCE
         } else {
@@ -218,21 +257,28 @@ impl Drop for Endpoint {
         };
         // SAFETY: `raw` is a live endpoint closed exactly once; the worker is alive (Rc).
         let status = unsafe { sys::ucp_ep_close_nbx(self.raw, &params) };
-        match self
-            .worker
-            .wait_until("ucp_ep_close_nbx", status, Some(CLOSE_TIMEOUT))
-        {
-            Ok(()) => debug!(peer = %self.state.peer, "endpoint closed"),
-            Err(e) if e.status.is_disconnect() => {
+        match StatusPtr::decode(status) {
+            StatusPtr::Done => debug!(peer = %self.state.peer, "endpoint closed"),
+            StatusPtr::Failed(s) if s.is_disconnect() => {
                 debug!(peer = %self.state.peer, "endpoint closed (peer already gone)");
             }
-            Err(e) => warn!(peer = %self.state.peer, error = %e, "endpoint close failed"),
+            StatusPtr::Failed(s) => {
+                warn!(peer = %self.state.peer, status = %s, "endpoint close failed")
+            }
+            StatusPtr::Pending(req) => {
+                debug!(peer = %self.state.peer, "endpoint closing in background");
+                self.worker.adopt(Orphan {
+                    op: "ucp_ep_close_nbx",
+                    req,
+                    keep: Box::new(Rc::clone(&self.state)),
+                });
+            }
         }
     }
 }
 
 unsafe extern "C" fn ep_error_cb(arg: *mut c_void, _ep: sys::ucp_ep_h, status: sys::ucs_status_t) {
-    // SAFETY: `arg` is the endpoint's boxed EpState, alive until the endpoint is closed.
+    // SAFETY: `arg` is the endpoint's EpState, kept alive (Rc) until the close completes.
     let state = unsafe { &*arg.cast::<EpState>() };
     let status = Status(status);
     state.failed.set(Some(status));

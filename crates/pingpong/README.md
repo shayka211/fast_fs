@@ -134,13 +134,16 @@ Typical numbers on the dev box (Ryzen 5600X, pinned to cores 2 and 4, 8 B, fresh
 
 | Setup | One-way overall |
 |---|---|
-| C `ucx_perftest` | 0.067 µs |
-| `pingpong client --overall-only` | 0.083 µs |
-| `pingpong client` (with percentiles) | 0.104 µs (p50 0.095 µs) |
+| C `ucx_perftest` | 0.065 µs |
+| `pingpong client --overall-only` | 0.075 µs |
+| `pingpong client` (with percentiles) | 0.090 µs (p50 0.090 µs) |
 | `--err-mode peer` (TCP) | ~4.5 µs |
 
-The remaining ~16 ns per hop vs C is the per-message allocation and copy in our receive path.
-It's tracked for M3 (zero-copy receive); see [`docs/PERF.md`](../../docs/PERF.md).
+Both sides receive with `Worker::progress_with`, a closure that sees each message's bytes
+*borrowed* from UCX during progress (no copy, no allocation). The server copies pings into a
+reused scratch buffer and replies after `progress_with` returns, because blocking sends
+aren't allowed inside the receive callback. How we got here, and why UCX's own "zero-copy"
+receive was slower, is in [`docs/PERF.md`](../../docs/PERF.md).
 
 **Restart the server between benchmark runs.** In the default `--err-mode none`, UCX doesn't
 report that a client left, so a long-lived server keeps endpoints to every past client, and

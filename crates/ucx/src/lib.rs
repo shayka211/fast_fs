@@ -1,20 +1,18 @@
-//! Safe RAII wrapper over UCX `ucp`. All UCX `unsafe` lives in this crate.
-//!
-//! Ownership: `Arc<Context>` → [`Worker`] (single thread, `!Send`) → [`Endpoint`], each
-//! holding its parent alive. Dropping releases the C resource.
-//!
-//! Logging (target `ucx`): `info` endpoints, `debug` resource lifecycle,
-//! `trace` every AM sent/received. UCX's internal logs: `UCX_LOG_LEVEL=debug`.
+#![doc = include_str!("../README.md")]
 
 mod context;
 mod endpoint;
+mod message;
+mod request;
 mod status;
 mod worker;
 
 pub use context::Context;
 pub use endpoint::{Endpoint, ErrorMode, TransportLane};
+pub use message::{AmMessage, AmView, HEADER_INLINE, Header, PAYLOAD_INLINE, Payload, SmallBytes};
+pub use request::{SendBuf, SendRequest};
 pub use status::{Error, Result, Status};
-pub use worker::{AmId, AmMessage, Worker};
+pub use worker::{AmId, Worker};
 
 use std::fmt;
 

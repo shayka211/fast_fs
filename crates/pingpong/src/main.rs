@@ -12,7 +12,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use hdrhistogram::Histogram;
 use tracing::{debug, info, warn};
-use ucx::{AmId, AmMessage, Context, Endpoint, ErrorMode, Worker};
+use ucx::{AmId, Context, Endpoint, ErrorMode, Worker};
 
 /// Header = client token (u32 LE), data = payload.
 const PING: AmId = 1;
@@ -115,8 +115,21 @@ fn server(worker: &Worker, listen: SocketAddr, mode: ErrorMode) -> Result<()> {
 
     // Index = client token.
     let mut peers: Vec<Option<Endpoint>> = Vec::new();
+    // Received pings, copied out of the zero-copy view (replies can't be sent blocking from
+    // inside the receive callback). Reused every loop: no allocation after warmup.
+    let mut scratch: Vec<u8> = Vec::new();
+    let mut pings: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
     loop {
-        worker.progress();
+        scratch.clear();
+        pings.clear();
+        worker.progress_with(|m| match token_of(m.header) {
+            Some(token) => {
+                let start = scratch.len();
+                scratch.extend_from_slice(m.data);
+                pings.push((token, start..scratch.len()));
+            }
+            None => warn!(am_id = m.id, header = ?m.header, "message without token, dropping"),
+        })?;
         // Lock-free channel poll: no syscall in the data loop.
         while let Ok(j) = joined.try_recv() {
             match Endpoint::connect(worker, &j.address, j.peer.to_string(), mode) {
@@ -130,8 +143,8 @@ fn server(worker: &Worker, listen: SocketAddr, mode: ErrorMode) -> Result<()> {
                 Err(e) => warn!(peer = %j.peer, error = %e, "connect to joined peer failed"),
             }
         }
-        while let Some(msg) = worker.try_recv() {
-            pong(&peers, &msg);
+        for (token, range) in pings.drain(..) {
+            pong(&peers, token, &scratch[range]);
         }
         // Dropping a failed endpoint closes it (only reported in `--err-mode peer`).
         for slot in &mut peers {
@@ -143,15 +156,12 @@ fn server(worker: &Worker, listen: SocketAddr, mode: ErrorMode) -> Result<()> {
 }
 
 /// Echoes a PING back to the peer named by its token.
-fn pong(peers: &[Option<Endpoint>], msg: &AmMessage) {
-    let peer = token_of(&msg.header)
-        .and_then(|t| peers.get(t as usize))
-        .and_then(Option::as_ref);
-    let Some(peer) = peer else {
-        warn!(am_id = msg.id, header = ?msg.header, "message with unknown token, dropping");
+fn pong(peers: &[Option<Endpoint>], token: u32, data: &[u8]) {
+    let Some(peer) = peers.get(token as usize).and_then(Option::as_ref) else {
+        warn!(token, "ping with unknown token, dropping");
         return;
     };
-    if let Err(e) = peer.send_am(PONG, &[], &msg.data) {
+    if let Err(e) = peer.send_blocking(PONG, &[], data) {
         warn!(peer = peer.peer(), error = %e, "pong failed");
     }
 }
@@ -190,12 +200,14 @@ fn run_client(worker: &Worker, token: &[u8; 4], ep: &Endpoint, opts: RunOpts) ->
             measured_since = Instant::now();
             t = measured_since;
         }
-        ep.send_am(PING, token, &payload)
+        ep.send_blocking(PING, token, &payload)
             .with_context(|| format!("ping #{i}"))?;
-        let pong = loop {
-            worker.progress();
-            if let Some(m) = worker.try_recv() {
-                break m;
+        // Zero-copy receive: we only need the pong's length.
+        let mut pong_len = None;
+        let pong_len = loop {
+            worker.progress_with(|m| pong_len = Some(m.data.len()))?;
+            if let Some(n) = pong_len {
+                break n;
             }
             if let Some(status) = ep.failed() {
                 bail!("server connection failed: {status}");
@@ -214,8 +226,8 @@ fn run_client(worker: &Worker, token: &[u8; 4], ep: &Endpoint, opts: RunOpts) ->
                 );
             }
         }
-        if pong.data.len() != size {
-            bail!("pong #{i}: expected {size} bytes, got {}", pong.data.len());
+        if pong_len != size {
+            bail!("pong #{i}: expected {size} bytes, got {pong_len}");
         }
     }
 

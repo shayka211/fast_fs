@@ -158,6 +158,46 @@ into a buffer it set up once. M3 will fix this:
 - a pooled buffer allocator;
 - a TSC-based clock for latency histograms.
 
+## Case study 2: "zero-copy" made it slower (M3a)
+
+Goal: remove the ~16 ns per hop of `malloc` + copy in the receive path. Every step was
+measured A/B against the previous commit, built in a separate `git worktree`, on the same
+pinned cores, with runs alternated (old, new, old, new, …).
+
+| Receive design | One-way overall |
+|---|---|
+| Before (M2): copy each message into `Vec`s, queue it | 0.081 µs |
+| UCX persistent data (`UCP_AM_FLAG_PERSISTENT_DATA`), payload released on drop | 0.101 µs |
+| No persistent data, small payloads copied inline (`SmallBytes`, no malloc) | 0.099 µs |
+| **Closure called during progress with borrowed `&[u8]` (`progress_with`)** | **0.075 µs** |
+| C `ucx_perftest` | 0.065 µs |
+
+What we learned:
+- **UCX's "zero-copy" receive costs more for small messages on shared memory.** A shm
+  message sits in a FIFO slot that must be recycled, so UCX copies it into a descriptor to
+  let you keep it, and releasing it costs one more call: +10 ns. It is worth it only where
+  receive buffers really are DMA targets (RDMA), and our bulk data will use RMA anyway.
+- **Avoiding `malloc` by storing inline didn't help either.** The owned message grew to about
+  120 bytes and was copied several times (into the queue, out of it, out of `Option`).
+- **The winner skips the queue entirely.** It hands the user a *borrowed view* while UCX's
+  buffer is valid, exactly like the C benchmark. The queue API still exists, built on the
+  same dispatch point, so there's one code path and no duplication.
+- `perf annotate` (instruction-level samples) showed the extra work sitting right after
+  `ucp_worker_progress` returned in the spin loop. That's what pointed at the queue design
+  rather than UCX.
+- **The `COPY_HEADER` send flag cost nothing**, and it is what makes a non-blocking send safe
+  with a borrowed header, so we keep it.
+
+Pitfalls we hit while measuring:
+- **A forgotten `pingpong server` busy-polling on core 2** made both C and Rust look 3–6x
+  slower (C "overall" jumped to 0.262 µs while its p50 stayed 0.065). Check
+  `ps -eo pid,psr,pcpu,comm --sort=-pcpu` before trusting numbers.
+- **An `std::env::var_os` toggle inside the send path** (for an experiment) added ~60 ns: it
+  takes a lock on every call. Read configuration once (`OnceLock`), never in hot paths.
+
+Remaining ~10 ns: the client's `send_blocking` plus the per-call sink setup and re-entrancy
+guard in `progress_with`. It's left for now; M3b's actor thread adds far more than this.
+
 ## Rules of thumb we learned
 
 1. Pin both sides before measuring anything.
@@ -167,3 +207,6 @@ into a buffer it set up once. M3 will fix this:
 5. Don't let the stopwatch become the workload: at sub-100 ns, clock reads matter.
 6. Keep control-plane transports (TCP, connection setup) off the data worker. Best of all,
    exchange addresses out-of-band so UCX never opens a TCP connection.
+7. "Zero-copy" is a hypothesis, not a fact: measure it. Fewer copies can still mean more work.
+8. A/B against the previous commit in a separate worktree, alternating runs, same cores.
+9. Before benchmarking, check nothing else is spinning on your cores.

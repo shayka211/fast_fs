@@ -125,7 +125,14 @@ verified by benchmarking against C `ucx_perftest`.
 (`docs/PERF.md`). Remaining ~16 ns/hop = per-message `Vec` alloc + copy + queue in the AM callback → fixed in M3
 (zero-copy receive with `UCP_AM_FLAG_PERSISTENT_DATA`, buffer pool, TSC clock).
 
-| M3 | Async `TransportActor` + `Transport` trait; zero-copy AM receive; heartbeat-based peer liveness | same bench async ≤ C+10%; event vs busy-poll recorded |
+| M3a ✅* | `ucx`: non-blocking owned `send` + `SendRequest`, background close, zero-copy `progress_with` receive, inline small messages | pingpong within ~10% of C |
+| M3b | `transport` crate: `TransportActor` thread + `TransportHandle` (tokio), `Transport` trait, busy-poll vs event mode | async pingpong; latency per mode recorded |
+| M3c | Cluster bootstrap (`NodeId` → address config, full mesh, "ready"), heartbeat liveness via `watch` | launcher: kill -9 a node, others detect it |
+
+\* M3a result: **0.075 µs** one-way vs C 0.065 µs (~15%; target was 10%). Persistent AM data
+(UCX's "zero-copy") was *slower* on shm; borrowed `AmView` in `progress_with` is the fast path.
+See `docs/PERF.md` case study 2.
+
 | M4 | Raft core + simulator | invariants hold over many seeds |
 | M5 | WAL + snapshots | crash recovery in sim and kill -9 |
 | M6 | Metadata FS over Raft + client CLI | create/mkdir/lookup/readdir/rename/unlink |

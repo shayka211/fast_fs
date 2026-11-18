@@ -1,19 +1,4 @@
-//! Logging setup shared by every fast_fs binary. Call [`init`] first thing in `main`
-//! and keep the returned guard alive until exit.
-//!
-//! Environment:
-//! - `RUST_LOG`: filter, e.g. `info` (default), `debug`, `ucx=trace,pingpong=debug`.
-//! - `FASTFS_LOG_FORMAT`: `compact` (default), `pretty` (multi-line, file:line), `json`.
-//! - `FASTFS_LOG_DIR`: also write `<process>.log` (JSON lines) into this directory, so many
-//!   local node processes keep separate, greppable logs (`jq` friendly).
-//!
-//! Every line emitted on the main thread carries the process identity (the root span,
-//! e.g. `pingpong{role=server}`), so interleaved output from many processes in one
-//! terminal stays readable.
-//!
-//! Levels (see CLAUDE.md): error = failed, can't proceed; warn = recoverable anomaly;
-//! info = lifecycle (startup, bound, connected, results); debug = per-connection/control
-//! details; trace = every message sent/received.
+#![doc = include_str!("../README.md")]
 
 use std::{env, io::IsTerminal, path::PathBuf};
 

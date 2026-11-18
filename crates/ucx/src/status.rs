@@ -43,12 +43,29 @@ impl fmt::Display for Status {
     }
 }
 
-/// A failed UCX call: which operation, and why.
+/// Errors from the `ucx` crate. Every one is recoverable: the worker stays usable.
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{op} failed: {status}")]
-pub struct Error {
-    pub op: &'static str,
-    pub status: Status,
+pub enum Error {
+    /// A UCX call failed: which operation, and why.
+    #[error("{op} failed: {status}")]
+    Ucx { op: &'static str, status: Status },
+    /// Something that progresses the worker (`progress*`, `drain`, `send_blocking`,
+    /// `SendRequest::wait`) was called from inside a `progress_with` closure. UCX forbids
+    /// re-entering progress from a receive callback; only non-blocking sends are allowed.
+    #[error(
+        "{op} called from inside a receive callback (only non-blocking sends are allowed there)"
+    )]
+    Reentrant { op: &'static str },
+}
+
+impl Error {
+    /// The UCX status, if this error came from UCX.
+    pub fn status(&self) -> Option<Status> {
+        match self {
+            Self::Ucx { status, .. } => Some(*status),
+            Self::Reentrant { .. } => None,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -57,7 +74,7 @@ pub(crate) fn check(op: &'static str, status: sys::ucs_status_t) -> Result<()> {
     if status == sys::UCS_OK {
         Ok(())
     } else {
-        Err(Error {
+        Err(Error::Ucx {
             op,
             status: Status(status),
         })
