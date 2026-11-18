@@ -304,7 +304,7 @@ Test layers:
 | M0–M2 ✅ | workspace, UCX build, safe sync wrapper, TCP bootstrap, logging | pingpong vs `ucx_perftest` |
 | M3a ✅ | `ucx`: non-blocking send, background close, zero-copy `progress_with`, recoverable errors | 0.075 µs vs C 0.065 µs |
 | **Transport** | | |
-| M3b.1 | `types` crate: ID newtypes + versioned wire header (encode/decode) | round-trip + rejects bad versions (proptest) |
+| M3b.1 ✅ | `types` crate: ID newtypes + versioned wire header (encode/decode) | round-trip + rejects bad versions (proptest) |
 | M3b.2 | `transport` crate: `TransportActor` thread (busy-poll) + `TransportHandle` (tokio), messages by `NodeId` | async pingpong works; latency recorded |
 | M3b.3 | event mode (`efd`/`arm`) | both modes benchmarked, CPU use compared |
 | M3c.1 | `node` binary + config (`node_id`, seeds, drives, failure domain) + join via seeds, lazy connections | 3 local nodes exchange messages |

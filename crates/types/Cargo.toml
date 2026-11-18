@@ -1,0 +1,16 @@
+[package]
+name = "types"
+description = "Shared IDs and the versioned wire header (pure, no I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
