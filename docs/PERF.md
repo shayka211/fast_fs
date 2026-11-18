@@ -120,14 +120,19 @@ polling loop, and with it the time to notice each incoming message.
 
 So shared memory itself was never slow. We were paying for TCP polling on every iteration.
 
-**Fix: two workers from one context.**
-- A **bootstrap worker** owns the listener and the TCP handshake. The server polls it only
-  every 256 loop iterations; M3 makes it event-driven on its own task.
+**First fix: two workers from one context.**
+- A **bootstrap worker** owns the UCX listener and the TCP handshake, and is polled rarely.
 - A **data worker** only ever gets direct worker-address endpoints, so it never activates
   TCP and its progress loop makes no syscalls.
 
-This also matches the cluster design: one control worker per node, and data workers (one per
-core, later).
+That fixed the problem (0.221 → 0.087 µs), but it was a workaround.
+
+**Final fix: don't let UCX touch TCP at all.** UCX's own `ucp_hello_world.c` and
+`ucx_perftest` swap worker addresses over a *plain* TCP socket (out-of-band), then create
+endpoints from those addresses. UCX never activates its TCP transport, so one worker is
+enough. We switched to that and deleted the UCX listener code, the two-worker split and
+the polling hack: **0.083 µs** with less code. The general lesson is to pick the bootstrap
+mechanism that keeps the data worker clean, instead of cleaning up after it.
 
 **Step 4: re-profile.** The top is now `uct_mm_iface_progress` (waiting for the peer, as in
 C). The next item was **our own stopwatch**: `__vdso_clock_gettime` at 14%. Two `Instant::now()`
@@ -141,9 +146,10 @@ TSC directly (`ucs_get_time`), which is cheaper.
 | C `ucx_perftest` | 0.065 µs | 0.070 µs |
 | Rust, single worker (bootstrap TCP still polled) | 0.221 µs | — |
 | Rust, two workers | 0.096 µs | 0.104 µs |
-| Rust, two workers, `--overall-only` (no per-iteration clocks) | — | **0.087 µs** |
+| Rust, two workers, `--overall-only` (no per-iteration clocks) | — | 0.087 µs |
+| Rust, plain-TCP bootstrap, one worker, `--overall-only` (current) | — | **0.083 µs** |
 
-**Remaining gap: about 17 ns per hop** of real messaging overhead. In the current profile the
+**Remaining gap: about 16 ns per hop** of real messaging overhead. In the current profile the
 Rust-side items are `WorkerInner::deliver`, `am_recv_cb` and `malloc`: each received message
 is copied into a fresh `Vec`, pushed through a `RefCell<VecDeque>`, then freed. C receives
 into a buffer it set up once. M3 will fix this:
@@ -159,4 +165,5 @@ into a buffer it set up once. M3 will fix this:
 3. Low IPC plus growing system time means syscalls or stalls in the hot loop: find them first.
 4. On AMD, sample with `cpu-clock:u`, not `cycles:u`.
 5. Don't let the stopwatch become the workload: at sub-100 ns, clock reads matter.
-6. Keep control-plane transports (TCP, connection setup) off the data worker.
+6. Keep control-plane transports (TCP, connection setup) off the data worker. Best of all,
+   exchange addresses out-of-band so UCX never opens a TCP connection.

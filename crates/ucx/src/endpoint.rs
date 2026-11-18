@@ -3,7 +3,6 @@
 use std::cell::Cell;
 use std::ffi::{CStr, CString, c_void};
 use std::fmt;
-use std::net::SocketAddr;
 use std::ptr;
 use std::rc::Rc;
 use std::time::Duration;
@@ -11,14 +10,17 @@ use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 use ucx_sys as sys;
 
-use crate::sockaddr::RawSockAddr;
 use crate::status::{Error, Result, Status, check};
-use crate::worker::{AmId, EpId, Worker, WorkerInner};
+use crate::worker::{AmId, Worker, WorkerInner};
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A connection to one peer. Usable immediately after creation: UCX queues sends until
-/// wire-up completes, so no Connecting/Connected typestate is needed.
+/// A connection to one peer, created from the peer's worker address. Usable immediately:
+/// UCX queues sends until wire-up completes, so no Connecting/Connected typestate is needed.
+///
+/// There is deliberately no UCX listener/sockaddr connect: addresses are exchanged
+/// out-of-band (a plain TCP socket at bootstrap, later cluster config/Raft), so UCX never
+/// activates its TCP transport and the data path stays on shared memory / RDMA.
 pub struct Endpoint {
     raw: sys::ucp_ep_h,
     /// Boxed so the error callback's `arg` pointer stays stable.
@@ -69,66 +71,29 @@ impl fmt::Display for TransportLane {
 }
 
 impl Endpoint {
-    /// Client side: connects to a [`crate::Listener`] at `addr`.
-    pub fn connect(worker: &Worker, addr: SocketAddr, mode: ErrorMode) -> Result<Self> {
-        let sockaddr = RawSockAddr::new(addr);
-        Self::create(&worker.inner, format!("{addr}"), mode, |params| {
-            params.field_mask |=
-                u64::from(sys::UCP_EP_PARAM_FIELD_FLAGS | sys::UCP_EP_PARAM_FIELD_SOCK_ADDR);
-            params.flags = sys::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER;
-            params.sockaddr = sockaddr.as_ucs();
-        })
-    }
-
-    /// Connects directly to a peer's worker address ([`Worker::address`]), with no
-    /// listener/TCP handshake. This is the fast path: it is how `ucx_perftest` connects.
-    /// Addresses are exchanged once at bootstrap (over a listener connection or config).
-    pub fn connect_address(
+    /// Connects to a peer's worker address ([`Worker::address`]); `peer` is a label for
+    /// logs. This is how `ucx_perftest` and `ucp_hello_world` connect.
+    pub fn connect(
         worker: &Worker,
         address: &[u8],
         peer: impl Into<String>,
         mode: ErrorMode,
     ) -> Result<Self> {
-        Self::create(&worker.inner, peer.into(), mode, |params| {
-            params.field_mask |= u64::from(sys::UCP_EP_PARAM_FIELD_REMOTE_ADDRESS);
-            params.address = address.as_ptr().cast();
-        })
-    }
-
-    /// Server side: accepts a connection request delivered to a listener.
-    pub(crate) fn accept(
-        worker: &Rc<WorkerInner>,
-        conn_request: sys::ucp_conn_request_h,
-        peer: Option<SocketAddr>,
-        mode: ErrorMode,
-    ) -> Result<Self> {
-        let peer = peer.map_or_else(|| "<unknown>".to_owned(), |a| a.to_string());
-        Self::create(worker, peer, mode, |params| {
-            params.field_mask |= u64::from(sys::UCP_EP_PARAM_FIELD_CONN_REQUEST);
-            params.conn_request = conn_request;
-        })
-    }
-
-    /// Shared construction: error handling + name, plus role-specific fields.
-    fn create(
-        worker: &Rc<WorkerInner>,
-        peer: String,
-        mode: ErrorMode,
-        role: impl FnOnce(&mut sys::ucp_ep_params_t),
-    ) -> Result<Self> {
         let state = Box::new(EpState {
-            peer,
+            peer: peer.into(),
             mode,
             failed: Cell::new(None),
         });
         // Named endpoints show up in UCX's own logs (UCX_LOG_LEVEL=debug).
         let name = CString::new(format!("fastfs->{}", state.peer)).unwrap_or_default();
-        let mut params = sys::ucp_ep_params_t {
+        let params = sys::ucp_ep_params_t {
             field_mask: u64::from(
-                sys::UCP_EP_PARAM_FIELD_ERR_HANDLER
+                sys::UCP_EP_PARAM_FIELD_REMOTE_ADDRESS
+                    | sys::UCP_EP_PARAM_FIELD_ERR_HANDLER
                     | sys::UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE
                     | sys::UCP_EP_PARAM_FIELD_NAME,
             ),
+            address: address.as_ptr().cast(),
             err_mode: mode.raw(),
             err_handler: sys::ucp_err_handler {
                 cb: Some(ep_error_cb),
@@ -137,24 +102,19 @@ impl Endpoint {
             name: name.as_ptr(),
             ..Default::default()
         };
-        role(&mut params);
 
         let mut raw = ptr::null_mut();
-        // SAFETY: params (and the sockaddr/name they point to) are valid for the call;
+        // SAFETY: params (and the address/name they point to) are valid for the call;
         // the error-handler arg is boxed and outlives the endpoint.
         check("ucp_ep_create", unsafe {
-            sys::ucp_ep_create(worker.raw, &params, &mut raw)
+            sys::ucp_ep_create(worker.inner.raw, &params, &mut raw)
         })?;
         info!(peer = %state.peer, ?mode, "endpoint created");
         Ok(Self {
             raw,
             state,
-            worker: Rc::clone(worker),
+            worker: Rc::clone(&worker.inner),
         })
-    }
-
-    pub fn id(&self) -> EpId {
-        EpId(self.raw as usize)
     }
 
     pub fn peer(&self) -> &str {
@@ -167,10 +127,8 @@ impl Endpoint {
     }
 
     /// Sends an Active Message and waits (progressing the worker) until the buffers can be
-    /// reused. The receiver learns which endpoint it came on via `AmMessage::reply_ep`.
-    ///
-    /// Blocking: on one worker, accept the server side *before* sending to it, or this
-    /// waits forever for a wire-up that can't finish. (M3 replaces this with async.)
+    /// reused. Blocking; M3 replaces this with async. The receiver does not learn which
+    /// endpoint a message came from: protocols carry the sender's identity in `header`.
     pub fn send_am(&self, id: AmId, header: &[u8], data: &[u8]) -> Result<()> {
         if let Some(status) = self.failed() {
             return Err(Error {
@@ -179,11 +137,7 @@ impl Endpoint {
             });
         }
         trace!(peer = %self.state.peer, am_id = id, header_len = header.len(), data_len = data.len(), "am send");
-        let params = sys::ucp_request_param_t {
-            op_attr_mask: sys::UCP_OP_ATTR_FIELD_FLAGS,
-            flags: sys::UCP_AM_SEND_FLAG_REPLY,
-            ..Default::default()
-        };
+        let params = sys::ucp_request_param_t::default();
         // SAFETY: header/data stay borrowed until `wait` returns, i.e. until UCX is done
         // with them.
         let status = unsafe {

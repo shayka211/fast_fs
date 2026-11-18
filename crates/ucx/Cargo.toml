@@ -10,7 +10,6 @@ publish.workspace = true
 ucx-sys.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-socket2.workspace = true
 
 [lints]
 workspace = true

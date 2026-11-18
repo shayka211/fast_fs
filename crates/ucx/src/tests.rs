@@ -1,18 +1,21 @@
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::*;
 
 const PING: AmId = 1;
 const PONG: AmId = 2;
+const SIZES: [usize; 4] = [0, 8, 64 << 10, 4 << 20];
 
-fn progress_until<T>(worker: &Worker, mut f: impl FnMut() -> Option<T>) -> T {
+fn recv_blocking(worker: &Worker) -> AmMessage {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         worker.progress();
-        if let Some(v) = f() {
-            return v;
+        if let Some(m) = worker.try_recv() {
+            return m;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for progress");
+        assert!(Instant::now() < deadline, "timed out waiting for a message");
     }
 }
 
@@ -23,49 +26,58 @@ fn runtime_matches_compiled_api() {
 }
 
 #[test]
-fn loopback_am_roundtrip_peer_mode() {
-    loopback_am_roundtrip(ErrorMode::Peer);
+fn roundtrip_peer_mode() {
+    roundtrip(ErrorMode::Peer);
 }
 
 #[test]
-fn loopback_am_roundtrip_no_err_mode() {
-    loopback_am_roundtrip(ErrorMode::None);
+fn roundtrip_no_err_mode() {
+    roundtrip(ErrorMode::None);
 }
 
-/// Client and server on one worker over a real listener: eager and rendezvous sizes,
-/// and replies routed back via `reply_ep`.
-fn loopback_am_roundtrip(mode: ErrorMode) {
+/// Two workers on two threads (as two nodes are), connected by exchanging worker
+/// addresses. Covers eager and rendezvous sizes, header passthrough, and that the data
+/// path never uses TCP in `ErrorMode::None`.
+///
+/// Each side needs its own thread: `send_am` blocks progressing only its own worker, and
+/// wire-up needs the peer to progress too.
+fn roundtrip(mode: ErrorMode) {
     let ctx = Context::new().unwrap();
-    let worker = Worker::new(&ctx).unwrap();
-    worker.register_am(PING).unwrap();
-    worker.register_am(PONG).unwrap();
+    let (to_echo, from_main) = mpsc::channel::<Vec<u8>>();
+    let (to_main, from_echo) = mpsc::channel::<Vec<u8>>();
 
-    let listener = Listener::bind(&worker, "127.0.0.1:0".parse().unwrap(), mode).unwrap();
-    assert_ne!(listener.local_addr().port(), 0);
-    let client = Endpoint::connect(&worker, listener.local_addr(), mode).unwrap();
-    // Creating the endpoint starts the connection; accept before the (blocking) send, which
-    // can't complete until the server side exists.
-    let server = progress_until(&worker, || listener.accept().unwrap());
-    client.send_am(PING, b"hdr", b"first").unwrap();
+    let echo_ctx = Arc::clone(&ctx);
+    let echo = thread::spawn(move || {
+        let w = Worker::new(&echo_ctx).unwrap();
+        w.register_am(PING).unwrap();
+        to_main.send(w.address().unwrap()).unwrap();
+        let ep = Endpoint::connect(&w, &from_main.recv().unwrap(), "main", mode).unwrap();
+        for _ in SIZES {
+            let ping = recv_blocking(&w);
+            assert_eq!((ping.id, &ping.header[..]), (PING, &b"from-main"[..]));
+            ep.send_am(PONG, &[], &ping.data).unwrap();
+        }
+    });
 
-    let first = progress_until(&worker, || worker.try_recv());
-    assert_eq!(
-        (first.id, &first.header[..], &first.data[..]),
-        (PING, &b"hdr"[..], &b"first"[..])
-    );
-    assert_eq!(first.reply_ep, Some(server.id()));
-
-    for size in [0, 8, 64 << 10, 4 << 20] {
+    let w = Worker::new(&ctx).unwrap();
+    w.register_am(PONG).unwrap();
+    to_echo.send(w.address().unwrap()).unwrap();
+    let ep = Endpoint::connect(&w, &from_echo.recv().unwrap(), "echo", mode).unwrap();
+    for size in SIZES {
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-        client.send_am(PING, &[], &payload).unwrap();
-        let ping = progress_until(&worker, || worker.try_recv());
-        assert_eq!(ping.data, payload, "ping size {size}");
-        assert_eq!(ping.reply_ep, Some(server.id()));
-
-        server.send_am(PONG, &[], &ping.data).unwrap();
-        let pong = progress_until(&worker, || worker.try_recv());
-        assert_eq!((pong.id, pong.reply_ep), (PONG, Some(client.id())));
-        assert_eq!(pong.data.len(), size);
+        ep.send_am(PING, b"from-main", &payload).unwrap();
+        let pong = recv_blocking(&w);
+        assert_eq!(pong.id, PONG);
+        assert_eq!(pong.data, payload, "size {size}");
     }
-    assert!(!client.transports().unwrap().is_empty());
+
+    let lanes = ep.transports().unwrap();
+    assert!(!lanes.is_empty());
+    if mode == ErrorMode::None {
+        assert!(
+            lanes.iter().all(|l| l.transport != "tcp"),
+            "same-host data path must not use TCP: {lanes:?}"
+        );
+    }
+    echo.join().unwrap();
 }

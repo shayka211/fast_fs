@@ -18,19 +18,12 @@ use crate::status::{Error, Result, Status, StatusPtr, check};
 /// Active Message handler id. Each service registers its own id.
 pub type AmId = u16;
 
-/// Opaque identity of a local endpoint; compare with [`crate::Endpoint::id`] to find
-/// which connection a message arrived on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EpId(pub(crate) usize);
-
 /// A fully received Active Message (eager and rendezvous are both delivered whole).
 #[derive(Debug)]
 pub struct AmMessage {
     pub id: AmId,
     pub header: Vec<u8>,
     pub data: Vec<u8>,
-    /// Local endpoint the message arrived on (set because senders use `SEND_FLAG_REPLY`).
-    pub reply_ep: Option<EpId>,
 }
 
 /// Single-threaded UCP worker. `!Send` by construction: a worker (and everything
@@ -65,7 +58,6 @@ struct PendingRndv {
     id: AmId,
     header: Vec<u8>,
     data: Vec<u8>,
-    reply_ep: Option<EpId>,
 }
 
 impl Worker {
@@ -127,7 +119,7 @@ impl Worker {
         Ok(())
     }
 
-    /// This worker's address blob, for peers to pass to [`crate::Endpoint::connect_address`].
+    /// This worker's address blob, for peers to pass to [`crate::Endpoint::connect`].
     pub fn address(&self) -> Result<Vec<u8>> {
         let mut addr = ptr::null_mut();
         let mut len = 0;
@@ -196,7 +188,6 @@ impl WorkerInner {
             am_id = msg.id,
             header_len = msg.header.len(),
             data_len = msg.data.len(),
-            from = ?msg.reply_ep,
             "am recv"
         );
         self.inbox.borrow_mut().push_back(msg);
@@ -247,8 +238,6 @@ unsafe extern "C" fn am_recv_cb(
     };
     // SAFETY: UCX passes a valid param struct for the duration of the callback.
     let param = unsafe { &*param };
-    let reply_ep = (param.recv_attr & u64::from(sys::UCP_AM_RECV_ATTR_FIELD_REPLY_EP) != 0)
-        .then_some(EpId(param.reply_ep as usize));
     // SAFETY: UCX guarantees `header` is valid for `header_length` bytes here.
     let header = unsafe { copy_bytes(header, header_length) };
 
@@ -256,12 +245,7 @@ unsafe extern "C" fn am_recv_cb(
         // Eager: data is valid only during this callback, so copy it out.
         // SAFETY: valid for `length` bytes during the callback.
         let data = unsafe { copy_bytes(data, length) };
-        worker.deliver(AmMessage {
-            id,
-            header,
-            data,
-            reply_ep,
-        });
+        worker.deliver(AmMessage { id, header, data });
         return sys::UCS_OK;
     }
 
@@ -272,7 +256,6 @@ unsafe extern "C" fn am_recv_cb(
         id,
         header,
         data: vec![0; length],
-        reply_ep,
     }));
     let params = sys::ucp_request_param_t {
         op_attr_mask: sys::UCP_OP_ATTR_FIELD_CALLBACK | sys::UCP_OP_ATTR_FIELD_USER_DATA,
@@ -315,7 +298,6 @@ impl PendingRndv {
             id: self.id,
             header: self.header,
             data: self.data,
-            reply_ep: self.reply_ep,
         }
     }
 }

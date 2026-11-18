@@ -75,18 +75,20 @@ faulty network, fake disk that loses un-fsynced writes). Any failing seed replay
 
 ## Connections (decided in M2, measured)
 
-- **Bootstrap, then direct.** A node's listener (sockaddr/TCP handshake) is used only to swap
-  UCX *worker addresses*; both sides then create direct endpoints (`Endpoint::connect_address`)
-  and **close the bootstrap endpoint**. The data phase holds no TCP connections; only the
-  listening socket stays open for new peers. Nodes are "ready" only after bootstrap completes.
+- **TCP only for startup.** Nodes swap UCX *worker addresses* over a plain TCP socket
+  (the `ucp_hello_world` pattern), close it, and create endpoints with
+  `Endpoint::connect(worker, address, ..)`. UCX never opens a TCP connection, so Raft and data
+  traffic run over shared memory / RDMA only. The `ucx` crate deliberately has no UCX
+  listener/sockaddr API. A node is "ready" only after bootstrap completes. Later, addresses
+  come from cluster config / the Raft cluster map instead.
 - **`ErrorMode::None` for data endpoints.** `ErrorMode::Peer` makes UCX exclude shared memory
   (it can't detect a dead peer), so same-host traffic drops to TCP: 4.5 µs vs 0.22 µs one-way.
   Peer liveness is the application's job (Raft heartbeats, RPC timeouts), not UCX's.
-- **Separate bootstrap and data workers.** A worker progresses every interface any of its
-  endpoints ever activated; bootstrap TCP on the data worker cost an `epoll_wait` syscall per
-  progress call (0.221 → 0.090 µs when split). Control/bootstrap worker is polled rarely or
-  event-driven; data workers only hold direct endpoints. See `docs/PERF.md`.
-- `TCP_CM_REUSEADDR=y` by default (see `ucx::context::DEFAULTS`) so restarted nodes rebind.
+- Why that matters: a UCX worker progresses every interface any endpoint ever activated.
+  An earlier UCX-listener bootstrap left TCP active, which cost an `epoll_wait` syscall per
+  progress call (0.221 vs 0.083 µs). See `docs/PERF.md`.
+- Peers identify themselves in AM headers (node id / token). UCX doesn't tell a receiver
+  which endpoint a message came from.
 
 ## Logging
 
@@ -116,14 +118,14 @@ verified by benchmarking against C `ucx_perftest`.
 |---|---|---|
 | M0 ✅ | Workspace: `ucx-sys`, `ucx`, `pingpong` (`transport` deferred to M3) | `cargo clippy` clean |
 | M1 ✅ | `build-ucx.sh`, `ucx-sys` bindgen + lookup | UCX 1.24 with posix/sysv/cma/tcp; runtime version test passes |
-| M2 ✅* | Safe sync wrapper: Context, Worker, Listener, Endpoint, AM; RAII; logging | 2-process 1M pings vs `ucx_perftest` (pinned cores) |
+| M2 ✅* | Safe sync wrapper: Context, Worker, Endpoint (by address), AM; RAII; logging; TCP bootstrap | 2-process 1M pings vs `ucx_perftest` (pinned cores) |
 
 \* M2 results (pinned, 8 B, one-way): TCP within 3% of C (4.52 vs 4.40 µs). Shared memory
-0.221 µs → **0.087 µs** overall vs C 0.070 µs after the two-worker fix (`docs/PERF.md`).
-Remaining ~17 ns/hop = per-message `Vec` alloc + copy + queue in the AM callback → fixed in M3
+0.221 µs → **0.083 µs** overall vs C 0.067 µs after moving the bootstrap to plain TCP
+(`docs/PERF.md`). Remaining ~16 ns/hop = per-message `Vec` alloc + copy + queue in the AM callback → fixed in M3
 (zero-copy receive with `UCP_AM_FLAG_PERSISTENT_DATA`, buffer pool, TSC clock).
 
-| M3 | Async `TransportActor` + `Transport` trait; zero-copy AM receive; event-driven bootstrap worker | same bench async ≤ C+10%; event vs busy-poll recorded |
+| M3 | Async `TransportActor` + `Transport` trait; zero-copy AM receive; heartbeat-based peer liveness | same bench async ≤ C+10%; event vs busy-poll recorded |
 | M4 | Raft core + simulator | invariants hold over many seeds |
 | M5 | WAL + snapshots | crash recovery in sim and kill -9 |
 | M6 | Metadata FS over Raft + client CLI | create/mkdir/lookup/readdir/rename/unlink |
