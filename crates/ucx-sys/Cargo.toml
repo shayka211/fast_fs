@@ -1,0 +1,16 @@
+[package]
+name = "ucx-sys"
+description = "Raw FFI bindings to UCX (ucp + ucs)"
+links = "ucp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+pkg-config.workspace = true
+
+[lib]
+# UCX's C doc comments contain code blocks rustdoc would try to compile.
+doctest = false

@@ -1,0 +1,11 @@
+# Embed a RUNPATH to the locally built UCX (scripts/build-ucx.sh) so binaries run directly
+# from target/ — no env needed. $ORIGIN-relative: bins live in target/<profile>/ and
+# tests/examples in target/<profile>/{deps,examples}/.
+# RUNPATH (not RPATH) means LD_LIBRARY_PATH still wins, e.g. to use the debug UCX build:
+#   LD_LIBRARY_PATH=$PWD/.ucx/debug/lib cargo run ...
+[target.'cfg(target_os = "linux")']
+rustflags = [
+    "-C", "link-arg=-Wl,--enable-new-dtags",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../.ucx/release/lib",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../../.ucx/release/lib",
+]

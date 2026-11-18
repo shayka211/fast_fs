@@ -1,0 +1,18 @@
+[package]
+name = "pingpong"
+description = "Two-process UCX Active Message latency benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ucx.workspace = true
+logging.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hdrhistogram.workspace = true
+
+[lints]
+workspace = true

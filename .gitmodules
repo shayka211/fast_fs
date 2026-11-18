@@ -1,0 +1,3 @@
+[submodule "ucx"]
+	path = ucx
+	url = git@github.com:openucx/ucx.git
