@@ -18,8 +18,8 @@ and the other (the **client**) measures how long each round trip takes.
 ```
  client                                              server
  ──────                                              ──────
-                                                     TcpListener on --listen
-                                                     (accepted on a background thread)
+TcpListener on --listen
+(accepted on a background thread)
  ── TCP connect ────────────────────────────────▶
  ── frame(client worker address) ───────────────▶
  ◀── token (u32) + frame(server worker address) ──
@@ -183,3 +183,84 @@ Profiling with `perf` is covered in [`docs/PERF.md`](../../docs/PERF.md).
 | `lanes` shows `tcp/...` | Running with `--err-mode peer`, which excludes shared memory |
 | Latency much higher than the table | Not pinned, debug build, a long-lived server (see above), CPU power-saving, or another busy process on those cores |
 | `error while loading shared libraries: libucp.so.0` | UCX not built: run `scripts/build-ucx.sh release` |
+
+
+
+UCX_PROTO_INFO=y pingpong client
+❯ UCX_PROTO_INFO=y taskset -c 4 ./target/release/pingpong client --size 65536 --iters 100000
+2026-11-18T16:43:29.069334Z  INFO main proc: pingpong: starting ucx=1.24.0 name="pingpong-client" role="client"
+2026-11-18T16:43:29.077850Z  INFO main proc: ucx::endpoint: endpoint created peer=127.0.0.1:13337 mode=None name="pingpong-client" role="client"
+2026-11-18T16:43:29.077860Z  INFO main proc: pingpong: bootstrap complete, TCP closed connect=127.0.0.1:13337 token=2 name="pingpong-client" role="client"
+2026-11-18T16:43:29.077960Z  INFO main proc: pingpong: running peer="127.0.0.1:13337" iters=100000 warmup=10000 size=65536 name="pingpong-client" role="client"
+[1795020209.078131] [cachyos-x8664:21725:0]   +--------+-------------+-----------------------------------+
+[1795020209.078131] [cachyos-x8664:21725:0]   | ucp_context_0 intra-node cfg#0                           |
+[1795020209.078131] [cachyos-x8664:21725:0]   | remote memory write by ucp_put* from host memory to host |
+[1795020209.078131] [cachyos-x8664:21725:0]   +--------+-------------+-----------------------------------+
+[1795020209.078131] [cachyos-x8664:21725:0]   | Range  | Description |              Config               |
+[1795020209.078131] [cachyos-x8664:21725:0]   +--------+-------------+-----------------------------------+
+[1795020209.078131] [cachyos-x8664:21725:0]   | 0..inf | zero-copy   | cma/memory                        |
+[1795020209.078131] [cachyos-x8664:21725:0]   +--------+-------------+-----------------------------------+
+[1795020209.078291] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078291] [cachyos-x8664:21725:0]   | ucp_context_0 intra-node cfg#0                                      |
+[1795020209.078291] [cachyos-x8664:21725:0]   | active message by ucp_am_send* from host memory                     |
+[1795020209.078291] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078291] [cachyos-x8664:21725:0]   |   Range   |                Description                |   Config    |
+[1795020209.078291] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078291] [cachyos-x8664:21725:0]   |     0..92 | short                                     | sysv/memory |
+[1795020209.078291] [cachyos-x8664:21725:0]   |  93..5028 | copy-in                                   | sysv/memory |
+[1795020209.078291] [cachyos-x8664:21725:0]   | 5029..inf | (?) rendezvous zero-copy read from remote | cma/memory  |
+[1795020209.078291] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078361] [cachyos-x8664:21725:0]   +--------------+-------------------------------------------+-------------+
+[1795020209.078361] [cachyos-x8664:21725:0]   | ucp_context_0 intra-node cfg#0                                         |
+[1795020209.078361] [cachyos-x8664:21725:0]   | active message by ucp_am_send*(fast-completion) from host memory       |
+[1795020209.078361] [cachyos-x8664:21725:0]   +--------------+-------------------------------------------+-------------+
+[1795020209.078361] [cachyos-x8664:21725:0]   |    Range     |                Description                |   Config    |
+[1795020209.078361] [cachyos-x8664:21725:0]   +--------------+-------------------------------------------+-------------+
+[1795020209.078361] [cachyos-x8664:21725:0]   |        0..92 | short                                     | sysv/memory |
+[1795020209.078361] [cachyos-x8664:21725:0]   |     93..8248 | copy-in                                   | sysv/memory |
+[1795020209.078361] [cachyos-x8664:21725:0]   | 8249..262143 | multi-frag copy-in                        | sysv/memory |
+[1795020209.078361] [cachyos-x8664:21725:0]   |    256K..inf | (?) rendezvous zero-copy read from remote | cma/memory  |
+[1795020209.078361] [cachyos-x8664:21725:0]   +--------------+-------------------------------------------+-------------+
+[1795020209.078500] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078500] [cachyos-x8664:21725:0]   | ucp_context_0 intra-node cfg#0                                      |
+[1795020209.078500] [cachyos-x8664:21725:0]   | active message by ucp_am_send*(multi) from host memory              |
+[1795020209.078500] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078500] [cachyos-x8664:21725:0]   |   Range   |                Description                |   Config    |
+[1795020209.078500] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078500] [cachyos-x8664:21725:0]   |     0..92 | short                                     | sysv/memory |
+[1795020209.078500] [cachyos-x8664:21725:0]   |  93..6030 | copy-in                                   | sysv/memory |
+[1795020209.078500] [cachyos-x8664:21725:0]   | 6031..inf | (?) rendezvous zero-copy read from remote | cma/memory  |
+[1795020209.078500] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078566] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078566] [cachyos-x8664:21725:0]   | ucp_context_0 intra-node cfg#0                                      |
+[1795020209.078566] [cachyos-x8664:21725:0]   | active message by ucp_am_send* with reply flag from host memory     |
+[1795020209.078566] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078566] [cachyos-x8664:21725:0]   |   Range   |                Description                |   Config    |
+[1795020209.078566] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078566] [cachyos-x8664:21725:0]   |     0..84 | short                                     | sysv/memory |
+[1795020209.078566] [cachyos-x8664:21725:0]   |  85..5028 | copy-in                                   | sysv/memory |
+[1795020209.078566] [cachyos-x8664:21725:0]   | 5029..inf | (?) rendezvous zero-copy read from remote | cma/memory  |
+[1795020209.078566] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+-------------+
+[1795020209.078624] [cachyos-x8664:21725:0]   +--------------+-------------------------------------------+-----------------------+
+[1795020209.078624] [cachyos-x8664:21725:0]   | ucp_context_0 intra-node cfg#0                                                   |
+[1795020209.078624] [cachyos-x8664:21725:0]   | active message by ucp_am_send* with reply flag(fast-completion) from host memory |
+[1795020209.078624] [cachyos-x8664:21725:0]   +--------------+-------------------------------------------+-----------------------+
+[1795020209.078624] [cachyos-x8664:21725:0]   |    Range     |                Description                |        Config         |
+[1795020209.078624] [cachyos-x8664:21725:0]   +--------------+-------------------------------------------+-----------------------+
+[1795020209.078624] [cachyos-x8664:21725:0]   |        0..84 | short                                     | sysv/memory           |
+[1795020209.078624] [cachyos-x8664:21725:0]   |     85..8240 | copy-in                                   | sysv/memory           |
+[1795020209.078624] [cachyos-x8664:21725:0]   | 8241..262143 | multi-frag copy-in                        | sysv/memory           |
+[1795020209.078624] [cachyos-x8664:21725:0]   |    256K..inf | (?) rendezvous zero-copy read from remote | cma/memory            |
+[1795020209.078624] [cachyos-x8664:21725:0]   +--------------+-------------------------------------------+-----------------------+
+[1795020209.078694] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+----------------+
+[1795020209.078694] [cachyos-x8664:21725:0]   | ucp_context_0 intra-node cfg#0                                         |
+[1795020209.078694] [cachyos-x8664:21725:0]   | active message by ucp_am_send* with reply flag(multi) from host memory |
+[1795020209.078694] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+----------------+
+[1795020209.078694] [cachyos-x8664:21725:0]   |   Range   |                Description                |     Config     |
+[1795020209.078694] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+----------------+
+[1795020209.078694] [cachyos-x8664:21725:0]   |     0..84 | short                                     | sysv/memory    |
+[1795020209.078694] [cachyos-x8664:21725:0]   |  85..6030 | copy-in                                   | sysv/memory    |
+[1795020209.078694] [cachyos-x8664:21725:0]   | 6031..inf | (?) rendezvous zero-copy read from remote | cma/memory     |
+[1795020209.078694] [cachyos-x8664:21725:0]   +-----------+-------------------------------------------+----------------+
+2026-11-18T16:43:29.199737Z  INFO main proc: pingpong: wire-up complete, measuring lanes=["sysv/memory", "posix/memory", "cma/memory"] name="pingpong-client" role="client"
+2026-11-18T16:43:30.565897Z  INFO main proc: pingpong: results iters=100000 size=65536 one_way_p50_us="6.779" one_way_p99_us="8.752" one_way_p999_us="12.303" one_way_max_us="96.064" one_way_mean_us="6.831" one_way_overall_us="6.831" msg_rate="73200" name="pingpong-client" role="client"
